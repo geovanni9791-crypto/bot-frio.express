@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import re
 from flask import Flask
 from threading import Thread
 from telegram import Update
@@ -19,7 +20,7 @@ def keep_alive():
     t = Thread(target=run_web)
     t.start()
 
-# 2. Base de datos con soporte para almacenar la última unidad consultada por usuario
+# 2. Base de datos
 def init_db():
     conn = sqlite3.connect('revisiones.db')
     cursor = conn.cursor()
@@ -36,53 +37,74 @@ def init_db():
 
 init_db()
 
-# Memoria temporal para saber qué unidad está modificando cada usuario con fotos
 ultima_unidad_usuario = {}
 
 async def guardar_plantilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text
-    if texto and "FRIO EXPRESS" in texto:
+    if not texto:
+        return
+
+    # Filtro inteligente: Buscamos si el mensaje parece un reporte buscando un número económico (ej. T-2191 o T-xxxx) o palabras clave
+    texto_upper = texto.upper()
+    tiene_formato = any(palabra in texto_upper for palabra in ["ECO", "UNIDAD", "REVISIÓN", "REVISION", "T-"])
+
+    if tiene_formato:
         no_eco = "Desconocido"
-        for linea in texto.split('\n'):
-            if "No. Eco" in linea or "Eco.:" in linea or "Eco" in linea:
-                no_eco = linea.split(":")[-1].strip()
-                break
         
-        # Aseguramos que el lugar siempre sea Aguascalientes en el texto guardado
-        if "Lugar:" in texto:
-            lineas = texto.split('\n')
-            nuevo_texto = []
-            for l in lineas:
-                if "Lugar:" in l:
-                    nuevo_texto.append("Lugar: Aguascalientes")
-                else:
-                    nuevo_texto.append(l)
-            texto = "\n".join(nuevo_texto)
+        # Intentamos extraer el número económico de forma flexible usando expresiones regulares
+        match_eco = re.search(r'T[-]?\d+', texto_upper)
+        if match_eco:
+            no_eco = match_eco.group(0)
+        else:
+            # Si no tiene T-, buscamos después de la palabra Eco
+            for linea in texto.split('\n'):
+                if "ECO" in linea.upper() or "UNIDAD" in linea.upper():
+                    partes = linea.split(":")
+                    if len(partes) > 1:
+                        no_eco = partes[-1].strip()
+                    break
+
+        # Forzar que el lugar sea siempre Aguascalientes de manera automática
+        lineas = texto.split('\n')
+        nuevo_texto = []
+        lugar_encontrado = False
         
+        for l in lineas:
+            if "LUGAR" in l.upper():
+                nuevo_texto.append("Lugar: Aguascalientes")
+                lugar_encontrado = True
+            else:
+                nuevo_texto.append(l)
+        
+        if not lugar_encontrado:
+            nuevo_texto.insert(0, "Lugar: Aguascalientes")
+            
+        plantilla_final = "\n".join(nuevo_texto)
+        
+        # Guardar en la base de datos
         conn = sqlite3.connect('revisiones.db')
         cursor = conn.cursor()
-        cursor.execute('INSERT INTO revisiones (no_eco, plantilla) VALUES (?, ?)', (no_eco, texto))
+        cursor.execute('INSERT INTO revisiones (no_eco, plantilla) VALUES (?, ?)', (no_eco, plantilla_final))
         conn.commit()
         conn.close()
         
-        await update.message.reply_text(f"✅ ¡Plantilla completa de la unidad {no_eco} guardada con éxito! (Lugar fijado en Aguascalientes)")
+        await update.message.reply_text(f"✅ ¡Plantilla de la unidad {no_eco} guardada automáticamente (Lugar: Aguascalientes)!")
 
 async def buscar_unidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ Escribe el número económico. Ejemplo: /buscar T-2191")
         return
 
-    no_eco_buscado = context.args[0].strip()
+    no_eco_buscado = context.args[0].strip().upper()
 
     conn = sqlite3.connect('revisiones.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT plantilla FROM revisiones WHERE no_eco LIKE ? ORDER BY id DESC LIMIT 1', (f"%{no_eco_buscado}%",))
+    cursor.execute('SELECT plantilla FROM revisiones WHERE UPPER(no_eco) LIKE ? ORDER BY id DESC LIMIT 1', (f"%{no_eco_buscado}%",))
     resultado = cursor.fetchone()
     conn.close()
 
     if resultado:
         plantilla_completa = resultado[0]
-        # Guardamos en memoria qué unidad está consultando este usuario
         ultima_unidad_usuario[update.effective_user.id] = {
             "no_eco": no_eco_buscado,
             "plantilla": plantilla_completa
@@ -97,25 +119,26 @@ async def modificar_con_foto(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Primero busca una unidad con /buscar [número] antes de enviar la foto del odómetro.")
         return
 
-    # Como mandó foto, le pedimos simular el odómetro o detectamos la intención
-    # (Aquí simularemos la lectura del odómetro o puedes capturar el texto que acompañe a la foto)
-    caption = update.message.caption or "Odómetro actualizado"
-    
+    caption = update.message.caption or "Actualizado por foto"
     datos = ultima_unidad_usuario[user_id]
     plantilla = datos["plantilla"]
     
-    # Reemplazamos o agregamos el kilometraje en la plantilla
-    if "Km" in plantilla or "Kilometraje" in plantilla:
-        lineas = plantilla.split('\n')
-        nueva_plantilla = []
-        for l in lineas:
-            if "Km" in l or "Kilometraje" in l:
-                nueva_plantilla.append(f"Kilometraje / Odómetro: {caption}")
-            else:
-                nueva_plantilla.append(l)
-        plantilla_actualizada = "\n".join(nueva_plantilla)
-    else:
-        plantilla_actualizada = plantilla + f"\nKilometraje: {caption}"
+    # Reemplazar el kilometraje en la plantilla de forma inteligente
+    lineas = plantilla.split('\n')
+    nueva_plantilla = []
+    km_actualizado = False
+    
+    for l in lineas:
+        if "KM" in l.upper() or "KILOMETRAJE" in l.upper() or "ODOMETRO" in l.upper():
+            nueva_plantilla.append(f"Kilometraje / Odómetro: {caption}")
+            km_actualizado = True
+        else:
+            nueva_plantilla.append(l)
+            
+    if not km_actualizado:
+        nueva_plantilla.append(f"Kilometraje: {caption}")
+        
+    plantilla_actualizada = "\n".join(nueva_plantilla)
 
     await update.message.reply_text(f"🔄 *Plantilla modificada con el odómetro:*\n\n{plantilla_actualizada}")
 
@@ -129,7 +152,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), guardar_plantilla))
     app.add_handler(MessageHandler(filters.PHOTO, modificar_con_foto))
 
-    print("🤖 Bot de Frio Express en la nube activo...")
+    print("🤖 Bot de Frio Express inteligente activo...")
     app.run_polling()
 
 if __name__ == '__main__':
