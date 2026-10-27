@@ -1,9 +1,25 @@
 import os
 import sqlite3
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Configurar base de datos local temporal
+# 1. Creamos un mini servidor web falso para que Render detecte el puerto abierto
+app_flask = Flask('')
+
+@app_flask.route('/')
+def home():
+    return "¡El bot de Frio Express está vivo y activo!"
+
+def run_web():
+    app_flask.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
+
+# 2. Configurar base de datos local temporal
 def init_db():
     conn = sqlite3.connect('revisiones.db')
     cursor = conn.cursor()
@@ -55,6 +71,9 @@ async def buscar_unidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No se encontró revisión para: {no_eco_buscado}")
 
 def main():
+    # Arrancamos el mini servidor web para cumplir con Render
+    keep_alive()
+    
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
 
